@@ -216,3 +216,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Datos (nunca subir al repo)
+*.csv
+*.parquet
+*.db
+data/
