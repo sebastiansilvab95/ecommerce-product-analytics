@@ -58,7 +58,7 @@ The only clean comparison is between the two fully observed middle cohorts: **27
 ## Recommendations
 
 1. **Fix the cart event before optimising anything downstream.** 43 categories with zero carts is not an analysis finding, it is a tracking defect. Every conversion metric, funnel dashboard and abandonment campaign built on this event inherits it. This is the only recommendation that should be actioned before the others.
-2. **Report conversion per category, never globally.** With smartphones at 39.4% of categorised views and converting at 3x the rest, the store-wide rate is a smartphone rate wearing a store-wide label. Segmenting is what makes every other category's performance visible at all.
+2. **Report conversion per category, never globally.** With one category taking 27.5% of all viewing sessions and converting at roughly 3x the rest, the store-wide rate is a smartphone rate wearing a store-wide label. Segmenting is what makes every other category's performance visible at all.
 3. **Target view→cart, not checkout.** Of the two funnel steps, only view→cart is measurable here, and it is where the volume is lost: 6.26% of viewing sessions show purchase intent. The testable hypothesis is on the product page — assortment, price visibility, page performance — measured on view→cart rate in a single category where the cart event is known to fire.
 4. **Do not use week-1 cohort retention as a KPI in this window.** With one month of data, both the earliest and latest cohorts are censored in opposite directions. Any target set against this curve would be measuring the observation window, not the product.
 
