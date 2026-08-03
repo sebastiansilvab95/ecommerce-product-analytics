@@ -92,6 +92,212 @@ ORDER BY 4 DESC;
 	no el producto. Dejo la conclusión original visible porque el error importa más que el acierto: una tasa de conversión baja puede ser un problema de negocio o un problema de medición, y no se distinguen sin mirar el evento intermedio.
 */
 
+-- PREGUNTA: ¿Cuáles son los tres productos más comprados dentro de cada categoría?
+
+WITH ventas AS (
+	SELECT
+		category_code,
+		product_id,
+		COUNT(*) AS compras
+	FROM events
+	WHERE event_type = 'purchase' AND category_code IS NOT NULL
+	GROUP BY 1, 2
+)
+SELECT
+	*
+FROM (
+	SELECT
+		v.*,
+		ROW_NUMBER() OVER (
+						   PARTITION BY category_code
+						   ORDER BY compras DESC
+		                  ) AS ranking
+	FROM ventas v	
+) x
+WHERE x.ranking <= 3
+ORDER BY category_code, ranking;
+
+/*
+	HALLAZGO: Existen categorías que no tiene suficientes ventas para tener un top 3.
+	electronics.smartphone es la categoría con mayor venta, el único que se le acerca es electronics.audio.headphone con el producto con mayor venta siendo casi un tercio del primero de smartphone.
+*/
+
+-- PREGUNTA: ¿Cuántas categorías no tienen productos suficientes para tener un top 3?
+
+WITH ventas AS (
+    SELECT
+        category_code,
+        product_id,
+        COUNT(*) AS compras
+    FROM events
+    WHERE event_type = 'purchase' AND category_code IS NOT NULL
+    GROUP BY 1, 2
+)
+SELECT
+    COUNT(DISTINCT category_code) AS total_categorias,
+    COUNT(DISTINCT category_code) FILTER (
+        WHERE category_code IN (
+            SELECT category_code
+            FROM ventas
+            GROUP BY category_code
+            HAVING COUNT(DISTINCT product_id) < 3
+        )
+    ) AS categorias_sin_top3
+FROM ventas;
+
+/*
+	HALLAZGO: electronics.smartphone es la categoría con más ventas: su producto líder (1.497 unidades) más que duplica al segundo lugar de todo el catálogo. 13 de 106 categorías no alcanzan a tener top 3
+	por falta de productos distintos vendidos.
+*/
+
+
+-- PREGUNTA: ¿Cuál es el tiempo desde la primera vista hasta la compra en promedio?
+
+WITH sesion AS (
+	SELECT
+		user_session,
+		MIN(event_time) FILTER (WHERE event_type = 'view') AS primera_vista,
+		MIN(event_time) FILTER (WHERE event_type = 'purchase') AS primera_compra
+	FROM events
+	GROUP BY 1
+)
+SELECT
+	COUNT(*) AS sesiones_con_compra,
+	ROUND(AVG(EXTRACT(EPOCH FROM (primera_compra - primera_vista)) / 60)::numeric, 1) AS minutos_promedio,
+	ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM (primera_compra - primera_vista)) / 60)::NUMERIC, 1) AS minutos_mediana
+FROM sesion
+WHERE primera_vista IS NOT NULL AND primera_compra IS NOT NULL;
+
+/*
+	HALLAZGO: El promedio es bastante superior a la mediana, por lo que exiten sesiones que se extendieron demasiado y mueven el promedio hacia arriba. Recomiendo usar la mediana para tener un estimado más accionable.
+*/
+
+-- PREGUNTA: ¿Qué sesiones agregaron productos al carro pero no compraron en esa misma sesión?
+
+SELECT c.user_session, COUNT(*) AS items_agregados
+FROM events c
+WHERE c.event_type = 'cart'
+  AND NOT EXISTS (
+      SELECT 1 FROM events p
+      WHERE p.user_session = c.user_session
+        AND p.event_type = 'purchase'
+  )
+GROUP BY 1
+ORDER BY 2 DESC
+LIMIT 20;
+
+/*
+	HALLAZGO: La sesión que lidera agrega 118 ítems al carro sin ninguna compra. Ninguna navegación real genera esa cifra: es la misma señal de instrumentación defectuosa de la query de carritos vs. compras
+	por semana, ahora visible a nivel de sesión individual en vez de agregada. No cambia la conclusión (el evento 'cart' no es confiable hasta corregirse), pero acota dónde buscar el origen del defecto.
+*/
+
+-- PREGUNTA: ¿Cuál es el porcentaje de las compras de cada producto en su categoría?
+
+WITH ventas AS (
+	SELECT
+		category_code,
+		product_id,
+		COUNT(*) AS compras
+	FROM events
+	WHERE event_type = 'purchase' AND category_code IS NOT NULL
+	GROUP BY 1,2
+)
+SELECT
+	x.*
+FROM (
+	  SELECT
+	  	v.category_code,
+	  	v.product_id,
+	  	v.compras,
+    	SUM(v.compras) OVER(PARTITION BY category_code) AS total_categoria,
+	  	ROUND(
+	  		100.0 * v.compras / SUM(v.compras) OVER(PARTITION BY category_code)
+	  		, 1) AS porcentaje
+	  FROM ventas v
+	 ) x
+WHERE x.porcentaje >= 10
+ORDER BY category_code, porcentaje DESC;
+
+/*
+	HALLAZGO: Existen productos que se llevan el 100% de su categoría (¿Propuestas poco atractivas o poca oferta de productos?).
+	En las categorías relacionadas a tecnología está más proporcionado el porcentaje por producto, lo que podría significar mayor oferta o mayor competitividad entre los productos.
+*/
+
+-- PREGUNTA: ¿Cuál es el promedio de día entre compras de los usuarios que han hecho al menos dos compras?
+
+WITH compras_por_dia AS (
+	SELECT DISTINCT
+		user_id,
+		DATE(event_time) AS dia_compra
+	FROM events
+	WHERE event_type = 'purchase'
+),
+con_anterior AS (
+	SELECT
+		user_id,
+		dia_compra,
+		LAG(dia_compra) OVER(
+						    PARTITION BY user_id
+						    ORDER BY dia_compra
+		   					) AS compra_anterior
+	FROM compras_por_dia
+)
+SELECT
+	user_id,
+	COUNT(*) + 1 AS total_compras, -- +1 porque la primera fila no tiene "anterior"
+	ROUND(AVG(dia_compra - compra_anterior), 1) AS dias_promedio_entre_compras
+FROM con_anterior
+WHERE compra_anterior IS NOT NULL
+GROUP BY user_id
+ORDER BY 2, dias_promedio_entre_compras ASC
+LIMIT 20;
+
+/*
+	HALLAZGO: Los 20 usuarios con recompra más rápida están todos en exactamente 1 día de promedio.
+	Esto es el extremo de la cola, no la tendencia general: el LIMIT 20 sobre un ORDER BY ascendente siempre muestra a los más veloces, no una muestra representativa. 
+	Ver la query siguiente para el panorama completo.
+*/
+
+-- PREGUNTA: ¿Cuál es el promedio general de días entre compras, considerando a todos los usuarios con 2 o más compras, no solo a los más rápidos?
+
+WITH compras_por_dia AS (
+	SELECT DISTINCT
+		user_id,
+		DATE(event_time) AS dia_compra
+	FROM events
+	WHERE event_type = 'purchase'
+),
+con_anterior AS (
+	SELECT
+		user_id,
+		dia_compra,
+		LAG(dia_compra) OVER(
+						    PARTITION BY user_id
+						    ORDER BY dia_compra
+		   					) AS compra_anterior
+	FROM compras_por_dia
+),
+por_usuario AS (
+	SELECT
+		user_id,
+		COUNT(*) + 1 AS total_compras,
+		AVG(dia_compra - compra_anterior) AS dias_promedio
+	FROM con_anterior
+	WHERE compra_anterior IS NOT NULL
+	GROUP BY user_id
+)
+SELECT
+    COUNT(*) AS usuarios_con_2_o_mas_compras,
+    ROUND(AVG(dias_promedio), 1) AS promedio_general_dias,
+    ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY dias_promedio)::numeric, 1) AS mediana_dias
+FROM por_usuario;
+
+/*
+	HALLAZGO: 4.567 usuarios registran 2 o más compras. El promedio general de días entre compras consecutivas es 6,1, mientras la mediana es 4,4: la misma asimetría hacia la derecha que aparece
+	en el tiempo vista→compra, con una cola de recompradores lentos tirando el promedio hacia arriba.
+	Con un mes de datos, este número está subestimado para usuarios cerca del inicio o el fin de la ventana, el mismo problema de censura de la retención por cohorte.
+*/
+
 -- PREGUNTA: ¿Cuál es la retención por cohorte semanal?
 
 WITH primera_actividad AS (
@@ -198,7 +404,7 @@ ORDER BY 5 DESC;
 	La categoría con mayor conversión es smartphone, teniendo muchísimas más vistas, aproximadamente un tercio de las vistas.
 	La categoría smartphone la vería aparte respecto al global, ya que su cantidad de vistas y compras opaca a las otras categorías, ocultando el verdadero valor de conversión y dificultando el poder crear planes de acción al respecto.
 	Nota metodológica: esta query agrupa por sesión Y categoría, así que una sesión que navega dos categorías se cuenta en ambas (561.617 pares sesión-categoría contra 458.901 sesiones reales). 
-	La unidad de análisis es el par, no la sesión. Eso también implica que puede haber compra sin carrito en una categoría mientras el carrito existe en otra — efecto distinto del defecto global.
+	La unidad de análisis es el par, no la sesión. Eso también implica que puede haber compra sin carrito en una categoría mientras el carrito existe en otra, efecto distinto del defecto global.
 */
 
 -- PREGUNTA: ¿Cuánto pesa una sola categoría en el tráfico, y cuánta actividad no está
@@ -235,3 +441,8 @@ SELECT
 FROM clasificadas
 GROUP BY 1
 ORDER BY 2 DESC;
+
+/*
+	HALLAZGO: electronics.smartphone concentra 27,5% de las sesiones con vista pese a ser una sola categoría, y convierte a 10,99% vista→carro frente a 3,70% del resto del catálogo (~3x). El 30,2% adicional 
+	sin category_code no puede analizarse por categoría. La tasa global de 6,26% mezcla estos tres grupos y no describe bien a ninguno.
+*/
