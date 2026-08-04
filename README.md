@@ -25,6 +25,8 @@ Purchases per view are flat all month (1.67–1.94%). Carts per view **double** 
  
 **2. 43 of 126 categories record exactly zero carts, and still record purchases.**
 Not few carts. Zero, across **112,543 product views and 530 purchases**. Apparel is the clearest case: **21 of its 22 categories record no cart event at all**, and the twenty-second records two. Any category-level "cart abandonment" conclusion drawn here would be a product conclusion about a tracking defect. This is why the cart→purchase rate is excluded from every recommendation below.
+
+*A note on process: my first read of the category-conversion query was a product conclusion, that apparel converted poorly because of weak offering or a page-level issue. Segmenting the funnel by category showed the real cause: 21 of 22 apparel categories never fire a cart event at all. I keep the original wrong hypothesis in the query comments rather than deleting it, because a low conversion rate can be a genuine product problem or a measurement problem, and the two don't look different until you check the event that sits between them.*
  
 **3. One category is the store, and the global funnel hides it.**
 Splitting viewing sessions three ways:
@@ -64,7 +66,7 @@ The only clean comparison is between the two fully observed middle cohorts: **27
  
 ## Further analysis
  
-The four findings above establish whether the funnel can be trusted. These five extend the analysis to product concentration, purchase timing and repeat-purchase behaviour, and one of them adds direct evidence to the cart-instrumentation problem in finding 1.
+These five extend the analysis to product concentration, purchase timing, repeat-purchase behaviour and user activity concentration, and one of them adds direct evidence to the cart-instrumentation problem in finding 1.
  
 **5. Median time to purchase is a fraction of the average, the same skew this repo keeps finding.**
  
@@ -93,8 +95,23 @@ Separately, **13 of 106 purchased categories don't have enough distinct products
 The leading session adds 118 items to cart without a single purchase. No plausible browsing session generates that; this reads as the same event-recording defect identified in finding 1, now visible in a single session rather than an aggregate. It does not change the conclusion: the cart event should not be trusted until fixed. It does show the defect is inspectable at the individual-session level, which narrows where a fix should be looked for.
  
 **8. Time between repeat purchases shows the same right-skew as time-to-purchase (finding 5).**
+
+*A note on process: the first version of this query ranked the 20 fastest repeat-buyers by average gap and returned exactly 1 day for all twenty. Read on its own, that looks like a finding. It isn't one: an `ORDER BY` ascending on a per-user average, capped at `LIMIT 20`, will always surface the fastest users in the dataset, by construction, regardless of what the population looks like. The number that answers the actual question, "how fast do repeat-buyers typically come back", needed the population-wide average and median below, not the top of a sorted list.*
  
 Among **4,567 users with two or more purchases**, the average gap between consecutive purchases is **6.1 days**, while the median is **4.4 days**. As with view-to-purchase time, the mean is pulled upward by a tail of slower repeat buyers; the median is the more representative figure for a "typical" repurchase window. This is descriptive only. With one month of data, "days between purchases" for users near the start or end of the window is necessarily undercounted, the same censoring problem as the cohort analysis in finding 4.
+
+**9. Active-day streaks are extremely concentrated: the median user's longest streak is a single day, while the top 20 reach 16–29 consecutive days.**
+
+| Metric | Value |
+|---|---|
+| Median longest streak (all users) | 1 day |
+| Longest streak (top user) | 29 days |
+| Top-20 streak range | 16–29 days |
+| Purchased at least once during their streak (top 20) | 55% (11 of 20) |
+
+Half the user base, at their most active point in the month, was never active on two consecutive days. The top 20 by streak length are a sharp outlier population, not a representative sample, and this is the clearest single expression of the concentration pattern already visible in findings 2 and 3 (zero-cart categories, one category carrying 27.5% of traffic). Within that outlier group, 55% purchased at least once during their streak, a purchase rate that (while not directly comparable, this is per-user, not per-view) sits well above the 1.67–1.94% weekly purchases-per-view figures in finding 1. Sustained activity is associated with purchase intent for roughly half this group; the other 45% stayed highly active without converting, which is a distinct question from the cart-instrumentation problem in finding 1, since these sessions may never have reached a cart step at all.
+
+*Limitation: the top streak's start date (Sep 30) falls one day before the sampled month begins, consistent with the same left-censoring boundary effect noted in finding 4 — worth a one-line disclosure rather than treating it as a clean 29-day figure.*
  
 ---
  
@@ -108,6 +125,7 @@ Among **4,567 users with two or more purchases**, the average gap between consec
 6. Does purchase volume concentrate in a few products within each category, or spread evenly, and does that pattern hold for the store's largest category?
 7. Is the cart-instrumentation problem from finding 1 visible at the level of individual sessions, not just in aggregate weekly ratios?
 8. Among users who purchase more than once, how much time typically passes between purchases?
+9. Do the most consistently active users behave differently from the rest, and does that sustained activity translate into purchases?
 ---
  
 ## Data and methodology
@@ -139,22 +157,28 @@ Stated up front, because they change how the numbers should be read:
 - **30.2% of views carry no `category_code`**, excluded from category analysis. That bucket alone holds 7,756 purchases, so category-level analysis covers a minority of activity.
 - **Timestamps are UTC** and the dataset carries no country information, so no local-time analysis is attempted and hour-of-day patterns are not interpreted as behaviour.
 - Observational data. Nothing here establishes causality; the recommendations are hypotheses to test, not proven effects.
+- **One streak's start date precedes the sampled month** (Sep 30, one day before Oct 1), the same boundary artefact as the first cohort in finding 4. Flagged, not corrected, since it affects one data point and the direction of the finding is unchanged.
+
 ---
  
 ## Analyses in `queries.sql`
- 
+
 - **Event volume and unique users by type and by week**: baseline activity, and the comparison that first surfaced the cart defect.
 - **Weekly carts-per-view vs purchases-per-view**: the test that separates behavioural change from instrumentation failure.
 - **Categories with zero cart events**: quantifies the defect, how many categories, how many views and purchases behind them.
 - **View→purchase conversion by category**: conditional aggregation with `FILTER`, `NULLIF` against division by zero, and a `HAVING` traffic floor.
+- **Top 3 products per category**: `ROW_NUMBER()` over `PARTITION BY category_code`, filtered in an outer query since window functions can't be referenced in the same `WHERE`.
+- **Categories without enough products for a top 3**: a correlated subquery with `HAVING COUNT(DISTINCT product_id) < 3` to find categories where a top-3 ranking isn't meaningful.
+- **View-to-first-purchase time, mean vs median**: `EXTRACT(EPOCH FROM ...)` for duration in minutes, `PERCENTILE_CONT` for the median.
+- **Cart adds with no purchase, by session**: anti-join with `NOT EXISTS` at the session level, not the user level, to avoid conflating a single abandoned cart with a user who never purchased all month.
+- **Product share within category**: `SUM() OVER (PARTITION BY category_code)` to get each product's percentage of category purchases without a self-join.
+- **Fastest repeat-purchase users (naive read)**: `LAG()` over each user's purchase dates, ranked by shortest average gap, kept as the query that motivates the population-wide version below.
+- **Days between repeat purchases, population-wide**: the same `LAG()` logic aggregated across all users with 2+ purchases, mean vs. median.
 - **Weekly cohort retention**: chained CTEs assigning each user a cohort by first-activity week, then measuring active weeks against cohort size.
 - **Session funnel: view → cart → purchase**: `MAX(CASE WHEN ...)` to collapse each session to one row before measuring drop-off.
 - **Session funnel by category**: the same funnel segmented, which surfaced the zero-cart categories.
-- **Top 3 products per category**: `ROW_NUMBER()` over `PARTITION BY category_code`, filtered in an outer query since window functions can't be referenced in the same `WHERE`.
-- **View-to-first-purchase time, mean vs median**: `EXTRACT(EPOCH FROM ...)` for duration in minutes, `PERCENTILE_CONT` for the median.
-- **Product share within category**: `SUM() OVER (PARTITION BY category_code)` to get each product's percentage of category purchases without a self-join.
-- **Cart adds with no purchase, by session**: anti-join with `NOT EXISTS` at the session level, not the user level, to avoid conflating a single abandoned cart with a user who never purchased all month.
-- **Days between repeat purchases**: `LAG()` over each user's purchase dates, restricted to users with 2+ purchases.
+- **Category traffic concentration**: splits sessions into smartphone vs. rest of catalogue vs. uncategorised, using a window `SUM() OVER ()` to get each group's share of total traffic.
+- **Longest run of consecutive active days per user**: gaps-and-islands technique (`ROW_NUMBER()` subtracted from the date) to group consecutive days, then `PERCENTILE_CONT` for the population median and a date-ranged join back to `events` to test purchase behaviour within each user's streak.
 
 ## Stack
  
@@ -212,6 +236,7 @@ CREATE INDEX idx_events_sess ON events(user_session);
 - Replicate the funnel and cohort analyses in pandas, comparing both approaches on the same questions
 - Retention heatmap and funnel visualisations
 - A/B test analysis on a separate dataset: proportion test, significance, and an explicit statement of what the result does **not** allow us to conclude
+- Segment the 45% of high-streak users who never converted, and compare against the 55% who did
 ---
  
 **Sebastián Silva Barraza**, Data & Product Analyst

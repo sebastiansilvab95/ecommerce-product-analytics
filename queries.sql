@@ -118,8 +118,8 @@ WHERE x.ranking <= 3
 ORDER BY category_code, ranking;
 
 /*
-	HALLAZGO: Existen categorías que no tiene suficientes ventas para tener un top 3.
-	electronics.smartphone es la categoría con mayor venta, el único que se le acerca es electronics.audio.headphone con el producto con mayor venta siendo casi un tercio del primero de smartphone.
+	HALLAZGO: Existen categorías que no tienen suficientes ventas para tener un top 3.
+	electronics.smartphone es la categoría con mayor venta, el único que se le acerca es electronics.audio.headphone con el producto con mayor venta siendo 39,3% del primero de smartphone.
 */
 
 -- PREGUNTA: ¿Cuántas categorías no tienen productos suficientes para tener un top 3?
@@ -169,7 +169,7 @@ FROM sesion
 WHERE primera_vista IS NOT NULL AND primera_compra IS NOT NULL;
 
 /*
-	HALLAZGO: El promedio es bastante superior a la mediana, por lo que exiten sesiones que se extendieron demasiado y mueven el promedio hacia arriba. Recomiendo usar la mediana para tener un estimado más accionable.
+	HALLAZGO: El promedio es bastante superior a la mediana, por lo que existen sesiones que se extendieron demasiado y mueven el promedio hacia arriba. Recomiendo usar la mediana para tener un estimado más accionable.
 */
 
 -- PREGUNTA: ¿Qué sesiones agregaron productos al carro pero no compraron en esa misma sesión?
@@ -249,7 +249,7 @@ SELECT
 FROM con_anterior
 WHERE compra_anterior IS NOT NULL
 GROUP BY user_id
-ORDER BY 2, dias_promedio_entre_compras ASC
+ORDER BY dias_promedio_entre_compras ASC
 LIMIT 20;
 
 /*
@@ -445,4 +445,128 @@ ORDER BY 2 DESC;
 /*
 	HALLAZGO: electronics.smartphone concentra 27,5% de las sesiones con vista pese a ser una sola categoría, y convierte a 10,99% vista→carro frente a 3,70% del resto del catálogo (~3x). El 30,2% adicional 
 	sin category_code no puede analizarse por categoría. La tasa global de 6,26% mezcla estos tres grupos y no describe bien a ninguno.
+*/
+
+-- PREGUNTA: ¿Cuál es la racha de días consecutivos activos por usuario?
+
+WITH dias AS (
+	SELECT DISTINCT
+		user_id,
+		DATE(event_time) AS dia
+	FROM events
+),
+grupos AS (
+	SELECT
+		user_id,
+		dia,
+		dia - (ROW_NUMBER() OVER (
+								 PARTITION BY user_id
+								 ORDER BY dia
+								 ))::int AS grupo
+	FROM dias
+)
+SELECT
+	user_id,
+	MIN(dia) AS inicio_racha,
+	MAX(dia) AS fin_racha,
+	COUNT(*) AS dias_consecutivos
+FROM grupos
+GROUP BY user_id, grupo
+ORDER BY dias_consecutivos DESC
+LIMIT 20;
+
+-- PREGUNTA: ¿Cuál es la mediana de la racha más larga entre todos los usuarios (no solo el top 20)?
+
+WITH dias AS (
+	SELECT DISTINCT
+		user_id,
+		DATE(event_time) AS dia
+	FROM events
+),
+grupos AS (
+	SELECT
+		user_id,
+		dia,
+		dia - (ROW_NUMBER() OVER (
+								 PARTITION BY user_id
+								 ORDER BY dia
+								 ))::int AS grupo
+	FROM dias
+),
+rachas AS (
+	SELECT
+		user_id,
+		MIN(dia) AS inicio_racha,
+		MAX(dia) AS fin_racha,
+		COUNT(*) AS dias_consecutivos
+	FROM grupos
+	GROUP BY user_id, grupo	
+),
+mejor_racha_por_usuario AS (
+    SELECT
+        user_id,
+        MAX(dias_consecutivos) AS racha_mas_larga
+    FROM rachas
+    GROUP BY user_id
+)
+SELECT
+	PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY racha_mas_larga) AS percentil
+FROM mejor_racha_por_usuario;
+
+-- PREGUNTA: De los usuarios con las rachas más largas, ¿qué porcentaje tuvo al menos un evento 'purchase' durante esa racha?
+
+WITH dias AS (
+	SELECT DISTINCT
+		user_id,
+		DATE(event_time) AS dia
+	FROM events
+),
+grupos AS (
+	SELECT
+		user_id,
+		dia,
+		dia - (ROW_NUMBER() OVER (
+								 PARTITION BY user_id
+								 ORDER BY dia
+								 ))::int AS grupo
+	FROM dias
+),
+rachas AS (
+	SELECT
+		user_id,
+		MIN(dia) AS inicio_racha,
+		MAX(dia) AS fin_racha,
+		COUNT(*) AS dias_consecutivos
+	FROM grupos
+	GROUP BY user_id, grupo
+	ORDER BY dias_consecutivos DESC
+	LIMIT 20
+),
+compras AS (
+	SELECT
+		r.user_id,
+		COUNT(*) FILTER (WHERE e.event_type = 'purchase') AS compro
+	FROM rachas r
+	LEFT JOIN events e 
+		ON 
+			r.user_id = e.user_id AND
+			e.event_time >= r.inicio_racha AND
+			e.event_time < r.fin_racha + INTERVAL '1 day' 
+	GROUP BY r.user_id
+)
+SELECT
+	ROUND( 100.0 * COUNT(*) FILTER (WHERE compro > 0) / 20, 2) AS porcentaje
+FROM compras;
+
+/*
+	HALLAZGO: El usuario con la racha más larga estuvo activo 29 días consecutivos (casi el mes completo), y el resto del top 20 se mueve entre 16 y 26 días. 
+	Comparado contra la mediana de la base completa, que es de apenas 1 día, esto confirma que la actividad sostenida es un comportamiento extremo, no representativo del 
+	usuario típico: la mitad de la base, en su mejor racha del mes, nunca estuvo activa dos días seguidos. Sin embargo, esa racha larga sí se traduce en negocio real: 
+	55% de los 20 usuarios con mayor racha compró al menos una vez durante su período de actividad sostenida. Es una tasa de conversión considerablemente más alta (aunque no directamente comparable, esto 
+	es por usuario y no por vista) que el rango de 1,67%–1,94% de compras por vista observado semana a semana, lo que sugiere que la actividad sostenida en el tiempo está asociada a mayor 
+	probabilidad de compra, no solo a más navegación sin propósito.
+	Recomendación: dado que el 45% restante de este grupo de alta actividad no compró pese a su nivel de engagement, valdría la pena segmentar ese subgrupo específico 
+	(los que navegan mucho pero no convierten) y revisar si hay fricción puntual en checkout, precio, o disponibilidad de stock que explique por qué su interés no se traduce en compra. 
+	Para el 55% que sí convierte, el siguiente paso sería identificar qué característica compartida tienen (categoría de producto, franja horaria, dispositivo) para replicar ese patrón 
+	hacia el resto de la base, donde la mediana de actividad es de solo 1 día.
 */
